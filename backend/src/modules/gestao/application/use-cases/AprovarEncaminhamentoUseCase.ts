@@ -1,0 +1,191 @@
+/**
+ * Aprovar encaminhamento (Face 2 · SMS).
+ *
+ * Pré-condição (gate):
+ *   status === 'AGUARDANDO_REGULACAO'   → senão 409 ENCAMINHAMENTO_NAO_AGUARDANDO_REGULACAO
+ *
+ * Isolamento:
+ *   - O `scope` (derivado do JWT) é aplicado na busca; encaminhamento de outra
+ *     prefeitura → 404 ENCAMINHAMENTO_NAO_ENCONTRADO (não vaza existência).
+ *
+ * Transição (transação atômica):
+ *   1. Se `nota` (após trim) presente → cria evento OBSERVACAO
+ *   2. Cria evento APROVADO (autor = regulador autenticado)
+ *   3. Se `agendamentoPrevisto` presente → cria evento AGENDADO + preenche o campo
+ *   4. Atualiza status para APROVADO + atualizadoEm
+ *   5. (futuro) enfileira notificação à UBS de origem
+ */
+import { StatusEncaminhamento } from '../../../../../generated/prisma';
+import type { Encaminhamento } from '../../../../domain/entities/Encaminhamento';
+import { prisma } from '../../../../infrastructure/database/prisma';
+import {
+  INCLUDE_ENCAMINHAMENTO_FULL,
+  rowParaEncaminhamento,
+} from '../../../../infrastructure/database/encaminhamentoMapper';
+import { whereByScopeViaUbs } from '../../../../infrastructure/database/scopeWhere';
+import { Conflict, NotFound, Unprocessable } from '../../../../shared/errors';
+import type { AccessScope } from '../../../../shared/scope';
+import { logger } from '../../../../infrastructure/logger';
+import { publicarNaTransacao } from '../../../../infrastructure/outbox/OutboxBus';
+import { encaminhamentoTransicao } from '../../../../infrastructure/metrics/prometheus';
+import {
+  MENSAGENS,
+  NotificacaoPacienteService,
+} from '../../../../infrastructure/services/NotificacaoPacienteService';
+
+export interface AutorRegulacao {
+  nome: string;
+  papel: string; // ex.: "Regulação · SMS"
+}
+
+export interface AprovarInput {
+  nota?: string;
+  agendamentoPrevisto?: string; // YYYY-MM-DD
+}
+
+export class AprovarEncaminhamentoUseCase {
+  private readonly notificacoes = new NotificacaoPacienteService();
+
+  async exec(
+    id: string,
+    scope: AccessScope,
+    autor: AutorRegulacao,
+    input: AprovarInput,
+  ): Promise<Encaminhamento> {
+    const atual = await prisma.encaminhamento.findFirst({
+      where: { id, ...whereByScopeViaUbs(scope) },
+    });
+    if (!atual) throw NotFound('ENCAMINHAMENTO_NAO_ENCONTRADO', 'Encaminhamento não encontrado');
+    if (atual.status !== StatusEncaminhamento.AGUARDANDO_REGULACAO) {
+      throw Conflict(
+        'ENCAMINHAMENTO_NAO_AGUARDANDO_REGULACAO',
+        'Encaminhamento não está aguardando regulação.',
+        { statusAtual: atual.status },
+      );
+    }
+
+    let agendamento: Date | null = null;
+    if (input.agendamentoPrevisto) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(input.agendamentoPrevisto)) {
+        throw Unprocessable(
+          'AGENDAMENTO_INVALIDO',
+          'agendamentoPrevisto deve ser uma data no formato YYYY-MM-DD',
+        );
+      }
+      agendamento = new Date(`${input.agendamentoPrevisto}T00:00:00.000Z`);
+      if (Number.isNaN(agendamento.getTime())) {
+        throw Unprocessable('AGENDAMENTO_INVALIDO', 'agendamentoPrevisto inválido');
+      }
+      const hojeUtc = new Date();
+      hojeUtc.setUTCHours(0, 0, 0, 0);
+      if (agendamento < hojeUtc) {
+        throw Unprocessable('AGENDAMENTO_NO_PASSADO', 'agendamentoPrevisto deve ser hoje ou no futuro');
+      }
+    }
+
+    const notaLimpa = input.nota?.trim();
+
+    const atualizado = await prisma.$transaction(async (tx) => {
+      // 1. nota → OBSERVACAO
+      if (notaLimpa) {
+        await tx.eventoTimeline.create({
+          data: {
+            encaminhamentoId: id,
+            tipo: 'OBSERVACAO',
+            titulo: 'Observação da Regulação',
+            descricao: notaLimpa,
+            autor: autor.nome,
+            autorPapel: autor.papel,
+          },
+        });
+      }
+      // 2. APROVADO
+      await tx.eventoTimeline.create({
+        data: {
+          encaminhamentoId: id,
+          tipo: 'APROVADO',
+          titulo: 'Encaminhamento aprovado',
+          descricao: notaLimpa
+            ? 'Aprovado pela Regulação com observação'
+            : 'Aprovado pela Regulação',
+          autor: autor.nome,
+          autorPapel: autor.papel,
+        },
+      });
+      // 3. AGENDADO (opcional)
+      if (agendamento) {
+        await tx.eventoTimeline.create({
+          data: {
+            encaminhamentoId: id,
+            tipo: 'AGENDADO',
+            titulo: 'Agendamento previsto',
+            descricao: `Atendimento previsto para ${input.agendamentoPrevisto}`,
+            autor: autor.nome,
+            autorPapel: autor.papel,
+          },
+        });
+      }
+      // 4. status + agendamento
+      const upd = await tx.encaminhamento.update({
+        where: { id },
+        data: {
+          status: StatusEncaminhamento.APROVADO,
+          agendamentoPrevisto: agendamento,
+        },
+        include: INCLUDE_ENCAMINHAMENTO_FULL,
+      });
+
+      // 5. outbox (mesma transação → atômico)
+      await publicarNaTransacao(tx, {
+        eventType: 'encaminhamento.aprovado',
+        aggregateType: 'Encaminhamento',
+        aggregateId: id,
+        payload: {
+          protocolo: upd.protocolo,
+          ubsId: upd.ubsId,
+          agendamentoPrevisto: input.agendamentoPrevisto ?? null,
+          aprovadoPor: autor.nome,
+        },
+      });
+
+      return upd;
+    });
+
+    encaminhamentoTransicao.inc({ de: 'AGUARDANDO_REGULACAO', para: 'APROVADO' });
+
+    logger.info(
+      { encId: id, protocolo: atualizado.protocolo, ubsId: atualizado.ubsId },
+      'encaminhamento aprovado',
+    );
+
+    // Notificação ao paciente (fire-and-forget)
+    void this.notificacoes
+      .notificar({
+        cpfPaciente: atualizado.pacienteCpf,
+        pacienteNome: atualizado.pacienteNome,
+        encaminhamentoId: id,
+        tipo: 'APROVADO',
+        ...MENSAGENS.aprovado(atualizado.protocolo),
+        payload: { protocolo: atualizado.protocolo },
+      })
+      .catch((err) => logger.warn({ err }, 'notificar APROVADO falhou'));
+
+    if (agendamento) {
+      void this.notificacoes
+        .notificar({
+          cpfPaciente: atualizado.pacienteCpf,
+          pacienteNome: atualizado.pacienteNome,
+          encaminhamentoId: id,
+          tipo: 'AGENDADO',
+          ...MENSAGENS.agendado(atualizado.protocolo, agendamento.toISOString()),
+          payload: {
+            protocolo: atualizado.protocolo,
+            agendamentoPrevisto: agendamento.toISOString(),
+          },
+        })
+        .catch((err) => logger.warn({ err }, 'notificar AGENDADO falhou'));
+    }
+
+    return rowParaEncaminhamento(atualizado);
+  }
+}

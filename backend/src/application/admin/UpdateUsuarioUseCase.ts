@@ -1,0 +1,95 @@
+import { prisma } from '../../infrastructure/database/prisma';
+import { Conflict, Forbidden, NotFound } from '../../shared/errors';
+import type { IAuditLogger } from '../../infrastructure/audit/PrismaAuditLogger';
+import type { AccessScope } from '../../shared/scope';
+import { ensurePrefeituraAcessivel, ensureUbsAcessivel } from '../../shared/scope';
+
+export interface UpdateUsuarioInput {
+  nome?: string;
+  email?: string;
+  telefone?: string;
+  cargo?: string;
+  funcao?: string;
+  ubsId?: string | null;
+  prefeituraId?: string | null;
+}
+
+/**
+ * Edita campos não-sensíveis de um usuário.
+ * Não permite mudar: role, matrícula, CPF, senha — para isso há endpoints específicos.
+ */
+export class UpdateUsuarioUseCase {
+  constructor(private readonly audit?: IAuditLogger) {}
+
+  async exec(scope: AccessScope, editorId: string, alvoId: string, input: UpdateUsuarioInput) {
+    const alvo = await prisma.atendente.findUnique({
+      where: { id: alvoId },
+      include: { ubs: true, prefeitura: true },
+    });
+    if (!alvo || alvo.deletadoEm) {
+      throw NotFound('ATENDENTE_NAO_ENCONTRADO', 'Atendente não encontrado');
+    }
+
+    // Escopo: editor deve ter acesso ao escopo atual do alvo.
+    if (alvo.role !== 'DESENVOLVEDOR') {
+      const alvoPref = alvo.prefeituraId ?? alvo.ubs?.prefeituraId;
+      if (alvoPref) ensurePrefeituraAcessivel(scope, alvoPref);
+    } else if (scope.kind !== 'GLOBAL') {
+      throw Forbidden('PERMISSAO_INSUFICIENTE', 'Apenas DESENVOLVEDOR pode editar outro DEV');
+    }
+
+    // Validação de novo ubsId/prefeituraId (se vier)
+    if (input.ubsId !== undefined && input.ubsId !== null) {
+      const ubs = await prisma.ubs.findUnique({ where: { id: input.ubsId } });
+      if (!ubs) throw NotFound('UBS_NAO_ENCONTRADA', 'UBS não encontrada');
+      ensureUbsAcessivel(scope, { id: ubs.id, prefeituraId: ubs.prefeituraId });
+    }
+    if (input.prefeituraId !== undefined && input.prefeituraId !== null) {
+      const pref = await prisma.prefeitura.findUnique({ where: { id: input.prefeituraId } });
+      if (!pref) throw NotFound('PREFEITURA_NAO_ENCONTRADA', 'Prefeitura não encontrada');
+      ensurePrefeituraAcessivel(scope, pref.id);
+    }
+
+    // Unicidade de email
+    if (input.email && input.email.toLowerCase() !== alvo.email) {
+      const exists = await prisma.atendente.findUnique({
+        where: { email: input.email.toLowerCase() },
+      });
+      if (exists) throw Conflict('USUARIO_DUPLICADO', 'Email já cadastrado');
+    }
+
+    const data: Record<string, unknown> = {};
+    if (input.nome !== undefined) data['nome'] = input.nome;
+    if (input.email !== undefined) data['email'] = input.email.toLowerCase();
+    if (input.telefone !== undefined) data['telefone'] = input.telefone || null;
+    if (input.cargo !== undefined) data['cargo'] = input.cargo;
+    if (input.funcao !== undefined) data['funcao'] = input.funcao;
+    if (input.ubsId !== undefined) data['ubsId'] = input.ubsId;
+    if (input.prefeituraId !== undefined) data['prefeituraId'] = input.prefeituraId;
+
+    const atualizado = await prisma.atendente.update({
+      where: { id: alvoId },
+      data,
+      include: { ubs: { include: { prefeitura: true } }, prefeitura: true },
+    });
+
+    await this.audit?.registrar({
+      acao: 'EDITAR_USUARIO',
+      recurso: 'Atendente',
+      recursoId: alvoId,
+      atendenteId: editorId,
+      payload: { campos: Object.keys(data) },
+    });
+
+    return {
+      id: atualizado.id,
+      nome: atualizado.nome,
+      matricula: atualizado.matricula,
+      email: atualizado.email,
+      role: atualizado.role,
+      ativo: atualizado.ativo,
+      ubs: atualizado.ubs ? { id: atualizado.ubs.id, nome: atualizado.ubs.nome } : null,
+      prefeitura: atualizado.prefeitura ?? atualizado.ubs?.prefeitura ?? null,
+    };
+  }
+}

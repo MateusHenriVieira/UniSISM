@@ -1,0 +1,328 @@
+/**
+ * Árvore hierárquica de encaminhamentos (Face 2 · file-manager da SMS).
+ *
+ *   nenhum param        → ArvoreUbsNode[]   (UBSs da prefeitura)
+ *   ?ubsId=...          → ArvoreAnoNode[]   (anos daquela UBS)
+ *   ?ubsId=...&ano=YYYY → ArvoreMesNode[]   (meses do ano)
+ *   ?ubsId=...&ano=YYYY&mes=M → ArvoreDiaNode[] (dias do mês)
+ *
+ * Escopo: PREFEITURA (DESENVOLVEDOR vê tudo · ADMIN/REGULADOR_SMS vê sua prefeitura).
+ *
+ * Estratégia: raw SQL com agregações + GROUP BY por status — uma query por nível.
+ * Indices necessários (definir em migration de produção):
+ *   - (prefeitura_id, ubsId, EXTRACT(YEAR FROM criado_em), EXTRACT(MONTH FROM criado_em))
+ */
+import { Prisma } from '../../../../../generated/prisma';
+import { prisma } from '../../../../infrastructure/database/prisma';
+import { BadRequest, Forbidden, NotFound } from '../../../../shared/errors';
+import type { AccessScope } from '../../../../shared/scope';
+import { CACHE_TTL, getCache } from '../../../../infrastructure/cache/Cache';
+
+interface ArvoreFilters {
+  respostaSUS: boolean | undefined;
+  excluirRascunho: boolean;
+}
+
+/**
+ * Compõe o trecho SQL adicional aplicado em todas as queries da árvore.
+ * Vazio se nada for solicitado.
+ */
+function filtroSql(f: ArvoreFilters): Prisma.Sql {
+  const parts: Prisma.Sql[] = [];
+  if (f.respostaSUS === true) {
+    parts.push(Prisma.sql`AND "respostaSusAnexoId" IS NOT NULL`);
+  } else if (f.respostaSUS === false) {
+    parts.push(Prisma.sql`AND "respostaSusAnexoId" IS NULL`);
+  }
+  if (f.excluirRascunho) {
+    parts.push(Prisma.sql`AND status <> 'RASCUNHO'`);
+  }
+  return parts.length > 0 ? Prisma.join(parts, ' ') : Prisma.empty;
+}
+
+// ---- Tipos de retorno ----
+
+export interface StatusContagem {
+  aguardando: number;
+  pendencia: number;
+  aprovado: number;
+  rejeitado: number;
+}
+
+export interface ArvoreUbsNode {
+  ubsId: string;
+  nome: string;
+  totalEncaminhamentos: number;
+  anoMaisRecente: number | null;
+  statusContagem: StatusContagem;
+}
+
+export interface ArvoreAnoNode {
+  ano: number;
+  totalEncaminhamentos: number;
+  statusContagem: StatusContagem;
+}
+
+export interface ArvoreMesNode {
+  mes: number;
+  totalEncaminhamentos: number;
+  statusContagem: StatusContagem;
+}
+
+export interface ArvoreDiaNode {
+  dia: number;
+  totalEncaminhamentos: number;
+  statusContagem: StatusContagem;
+}
+
+export type ArvoreNode = ArvoreUbsNode | ArvoreAnoNode | ArvoreMesNode | ArvoreDiaNode;
+
+// ---- Input ----
+
+export interface GetArvoreInput {
+  ubsId?: string;
+  ano?: number;
+  mes?: number;
+  /**
+   * `true` → conta apenas encaminhamentos com resposta SUS.
+   * `false` → apenas SEM resposta SUS.
+   * `undefined` → não filtra (default).
+   * Usado pela tela `/sms/respostas` (file-manager de respostas oficiais).
+   */
+  respostaSUS?: boolean;
+  /**
+   * `true` (default da tela) → exclui RASCUNHO da contagem. O atendente
+   * SMS só vê o que efetivamente chegou.
+   */
+  excluirRascunho?: boolean;
+}
+
+// ---- Helpers ----
+
+function vazio(): StatusContagem {
+  return { aguardando: 0, pendencia: 0, aprovado: 0, rejeitado: 0 };
+}
+
+function acumular(
+  agg: StatusContagem,
+  status: string,
+  qtd: number,
+): StatusContagem {
+  switch (status) {
+    case 'AGUARDANDO_REGULACAO':
+      agg.aguardando += qtd;
+      break;
+    case 'PENDENCIA_DOCUMENTO':
+      agg.pendencia += qtd;
+      break;
+    case 'APROVADO':
+      agg.aprovado += qtd;
+      break;
+    case 'REJEITADO':
+      agg.rejeitado += qtd;
+      break;
+  }
+  return agg;
+}
+
+// ---- Use Case ----
+
+export class GetArvoreEncaminhamentosUseCase {
+  private readonly cache = getCache();
+
+  async exec(scope: AccessScope, input: GetArvoreInput): Promise<ArvoreNode[]> {
+    if (input.mes !== undefined && input.ano === undefined) {
+      throw BadRequest('PARAMS_INCOMPATIVEIS', '`mes` exige `ano`');
+    }
+    if ((input.ano !== undefined || input.mes !== undefined) && !input.ubsId) {
+      throw BadRequest('PARAMS_INCOMPATIVEIS', '`ano`/`mes` exige `ubsId`');
+    }
+
+    if (scope.kind === 'UBS') {
+      throw Forbidden('PERMISSAO_INSUFICIENTE', 'Escopo UBS não pode usar a árvore');
+    }
+
+    const prefeituraFilter =
+      scope.kind === 'GLOBAL' ? null : scope.prefeituraId;
+
+    if (input.ubsId) {
+      const ubs = await prisma.ubs.findUnique({
+        where: { id: input.ubsId },
+        select: { id: true, prefeituraId: true },
+      });
+      if (!ubs) throw NotFound('UBS_NAO_ENCONTRADA', 'UBS não encontrada');
+      if (prefeituraFilter && ubs.prefeituraId !== prefeituraFilter) {
+        throw NotFound('UBS_NAO_ENCONTRADA', 'UBS não encontrada');
+      }
+    }
+
+    // chave de cache inclui todos os parâmetros do escopo + filtros
+    const respKey = input.respostaSUS === undefined ? '*' : String(input.respostaSUS);
+    const rascKey = input.excluirRascunho === undefined ? '*' : String(input.excluirRascunho);
+    const cacheKey = `arvore:${prefeituraFilter ?? 'GLOBAL'}:${input.ubsId ?? '*'}:${input.ano ?? '*'}:${input.mes ?? '*'}:r=${respKey}:nr=${rascKey}`;
+
+    return this.cache.remember(cacheKey, CACHE_TTL.ARVORE, () => this.compute(prefeituraFilter, input));
+  }
+
+  private compute(prefeituraFilter: string | null, input: GetArvoreInput): Promise<ArvoreNode[]> {
+    const filtros: ArvoreFilters = {
+      respostaSUS: input.respostaSUS,
+      excluirRascunho: input.excluirRascunho ?? false,
+    };
+    if (!input.ubsId) return this.nivelUbs(prefeituraFilter, filtros);
+    if (input.ano === undefined) return this.nivelAno(input.ubsId, filtros);
+    if (input.mes === undefined) return this.nivelMes(input.ubsId, input.ano, filtros);
+    return this.nivelDia(input.ubsId, input.ano, input.mes, filtros);
+  }
+
+  /**
+   * Invalidação: todo evento de transição de encaminhamento chama isto
+   * para limpar as entradas da árvore da UBS afetada + GLOBAL.
+   */
+  async invalidarCachePorUbs(prefeituraId: string, _ubsId: string): Promise<void> {
+    // Derrubamos toda a árvore — agregados são relativamente baratos de recalcular.
+    await this.cache.delByPrefix(`arvore:${prefeituraId}:`);
+    await this.cache.delByPrefix(`arvore:GLOBAL:`);
+  }
+
+  // ---- Nível 1: UBSs ----
+  private async nivelUbs(
+    prefeituraFilter: string | null,
+    filtros: ArvoreFilters,
+  ): Promise<ArvoreUbsNode[]> {
+    const ubsList = await prisma.ubs.findMany({
+      where: prefeituraFilter ? { prefeituraId: prefeituraFilter } : {},
+      select: { id: true, nome: true },
+      orderBy: { nome: 'asc' },
+    });
+
+    if (ubsList.length === 0) return [];
+
+    const ids = ubsList.map((u) => u.id);
+
+    type Row = { ubsId: string; status: string; qtd: bigint; max_ano: number | null };
+    const f = filtroSql(filtros);
+    const rows = await prisma.$queryRaw<Row[]>`
+      SELECT "ubsId", status,
+             COUNT(*)::bigint AS qtd,
+             MAX(EXTRACT(YEAR FROM "criadoEm"))::int AS max_ano
+      FROM encaminhamentos
+      WHERE "ubsId" = ANY(${ids})
+        ${f}
+      GROUP BY "ubsId", status
+    `;
+
+    const mapaUbs = new Map<string, ArvoreUbsNode>();
+    for (const u of ubsList) {
+      mapaUbs.set(u.id, {
+        ubsId: u.id,
+        nome: u.nome,
+        totalEncaminhamentos: 0,
+        anoMaisRecente: null,
+        statusContagem: vazio(),
+      });
+    }
+
+    for (const r of rows) {
+      const node = mapaUbs.get(r.ubsId);
+      if (!node) continue;
+      const qtd = Number(r.qtd);
+      node.totalEncaminhamentos += qtd;
+      acumular(node.statusContagem, r.status, qtd);
+      if (r.max_ano !== null && (node.anoMaisRecente === null || r.max_ano > node.anoMaisRecente)) {
+        node.anoMaisRecente = r.max_ano;
+      }
+    }
+
+    return [...mapaUbs.values()].sort(
+      (a, b) => b.totalEncaminhamentos - a.totalEncaminhamentos,
+    );
+  }
+
+  // ---- Nível 2: anos ----
+  private async nivelAno(ubsId: string, filtros: ArvoreFilters): Promise<ArvoreAnoNode[]> {
+    type Row = { ano: number; status: string; qtd: bigint };
+    const f = filtroSql(filtros);
+    const rows = await prisma.$queryRaw<Row[]>`
+      SELECT EXTRACT(YEAR FROM "criadoEm")::int AS ano, status, COUNT(*)::bigint AS qtd
+      FROM encaminhamentos
+      WHERE "ubsId" = ${ubsId}
+        ${f}
+      GROUP BY ano, status
+      ORDER BY ano DESC
+    `;
+    return this.agruparPorChave(rows, (r) => r.ano).map(({ chave, total, sc }) => ({
+      ano: chave,
+      totalEncaminhamentos: total,
+      statusContagem: sc,
+    }));
+  }
+
+  // ---- Nível 3: meses ----
+  private async nivelMes(
+    ubsId: string,
+    ano: number,
+    filtros: ArvoreFilters,
+  ): Promise<ArvoreMesNode[]> {
+    type Row = { mes: number; status: string; qtd: bigint };
+    const f = filtroSql(filtros);
+    const rows = await prisma.$queryRaw<Row[]>`
+      SELECT EXTRACT(MONTH FROM "criadoEm")::int AS mes, status, COUNT(*)::bigint AS qtd
+      FROM encaminhamentos
+      WHERE "ubsId" = ${ubsId}
+        AND EXTRACT(YEAR FROM "criadoEm") = ${ano}::int
+        ${f}
+      GROUP BY mes, status
+      ORDER BY mes DESC
+    `;
+    return this.agruparPorChave(rows, (r) => r.mes).map(({ chave, total, sc }) => ({
+      mes: chave,
+      totalEncaminhamentos: total,
+      statusContagem: sc,
+    }));
+  }
+
+  // ---- Nível 4: dias ----
+  private async nivelDia(
+    ubsId: string,
+    ano: number,
+    mes: number,
+    filtros: ArvoreFilters,
+  ): Promise<ArvoreDiaNode[]> {
+    type Row = { dia: number; status: string; qtd: bigint };
+    const f = filtroSql(filtros);
+    const rows = await prisma.$queryRaw<Row[]>`
+      SELECT EXTRACT(DAY FROM "criadoEm")::int AS dia, status, COUNT(*)::bigint AS qtd
+      FROM encaminhamentos
+      WHERE "ubsId" = ${ubsId}
+        AND EXTRACT(YEAR FROM "criadoEm") = ${ano}::int
+        AND EXTRACT(MONTH FROM "criadoEm") = ${mes}::int
+        ${f}
+      GROUP BY dia, status
+      ORDER BY dia DESC
+    `;
+    return this.agruparPorChave(rows, (r) => r.dia).map(({ chave, total, sc }) => ({
+      dia: chave,
+      totalEncaminhamentos: total,
+      statusContagem: sc,
+    }));
+  }
+
+  private agruparPorChave<R extends { status: string; qtd: bigint }>(
+    rows: R[],
+    keyOf: (r: R) => number,
+  ): Array<{ chave: number; total: number; sc: StatusContagem }> {
+    const agg = new Map<number, { total: number; sc: StatusContagem }>();
+    for (const r of rows) {
+      const k = keyOf(r);
+      const qtd = Number(r.qtd);
+      const slot = agg.get(k) ?? { total: 0, sc: vazio() };
+      slot.total += qtd;
+      acumular(slot.sc, r.status, qtd);
+      agg.set(k, slot);
+    }
+    return [...agg.entries()]
+      .map(([chave, v]) => ({ chave, total: v.total, sc: v.sc }))
+      .sort((a, b) => b.chave - a.chave);
+  }
+}

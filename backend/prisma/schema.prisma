@@ -1,0 +1,1490 @@
+// ======================================================================
+// Schema Prisma — Backend UNISISM · UBS
+// Modela todos os agregados consumidos pelo frontend (Face 1 / UBS).
+// ======================================================================
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum RoleAtendente {
+  DESENVOLVEDOR     // acesso global (todas prefeituras / UBSs)
+  ADMIN             // admin de uma prefeitura — vê todas UBSs daquela prefeitura
+  COORDENADOR_UBS   // coordena uma UBS — vê apenas dados da UBS
+  ATENDENTE_UBS     // atendente de uma UBS — vê apenas dados da UBS
+  REGULADOR_SMS     // regulador da SMS de uma prefeitura
+  GESTOR_TFD        // gestor de Tratamento Fora do Domicílio (Face 4) — frota, motoristas, viagens, ajuda de custo
+  REGULADOR_TFD     // regulador presencial TFD — cadastra solicitações; UI minimalista (Face 4 v0.10)
+}
+
+enum Sexo {
+  M
+  F
+  OUTRO
+}
+
+enum StatusEncaminhamento {
+  RASCUNHO
+  AGUARDANDO_REGULACAO
+  PENDENCIA_DOCUMENTO
+  APROVADO
+  REJEITADO
+}
+
+enum PrioridadeClinica {
+  ELETIVA
+  PRIORITARIA
+  URGENTE
+  EMERGENCIA
+}
+
+enum TipoAnexo {
+  SOLICITACAO
+  RG
+  CPF
+  CARTAO_SUS
+  EXAME
+  LAUDO
+  RESPOSTA_SUS
+  OUTRO
+}
+
+enum TipoEventoTimeline {
+  CRIADO
+  DOCUMENTO_ANEXADO
+  ENVIADO_REGULACAO
+  PENDENCIA_REGISTRADA
+  APROVADO
+  REJEITADO
+  AGENDADO
+  OBSERVACAO
+  RESPOSTA_SUS_RECEBIDA
+  EDITADO
+}
+
+enum TipoNotificacaoPaciente {
+  ENCAMINHAMENTO_CRIADO
+  PENDENCIA_REGISTRADA
+  PENDENCIA_RESOLVIDA
+  APROVADO
+  AGENDADO
+  REJEITADO
+  RESPOSTA_SUS_DISPONIVEL
+}
+
+enum GrupoSanguineo {
+  A_POSITIVO
+  A_NEGATIVO
+  B_POSITIVO
+  B_NEGATIVO
+  AB_POSITIVO
+  AB_NEGATIVO
+  O_POSITIVO
+  O_NEGATIVO
+  NAO_INFORMADO
+}
+
+enum EstadoCivil {
+  SOLTEIRO
+  CASADO
+  DIVORCIADO
+  VIUVO
+  UNIAO_ESTAVEL
+  OUTRO
+}
+
+enum RacaCor {
+  BRANCA
+  PRETA
+  PARDA
+  AMARELA
+  INDIGENA
+  NAO_INFORMADA
+}
+
+enum TipoAlergia {
+  MEDICAMENTO
+  ALIMENTO
+  AMBIENTAL
+  OUTRO
+}
+
+enum GravidadeAlergia {
+  LEVE
+  MODERADA
+  GRAVE
+}
+
+enum TipoAtendimento {
+  CONSULTA_MEDICA
+  ENFERMAGEM
+  VACINACAO
+  CURATIVO
+  ODONTOLOGICO
+  PROCEDIMENTO
+  ACOLHIMENTO
+}
+
+enum StatusViagemTFD {
+  AGENDADA
+  REALIZADA
+  CANCELADA
+  EM_ANDAMENTO
+}
+
+enum TransporteTFD {
+  VAN_SMS
+  AMBULANCIA
+  PASSAGEM_RODOVIARIA
+  PASSAGEM_AEREA
+}
+
+enum CategoriaExame {
+  LABORATORIAL
+  IMAGEM
+  FUNCIONAL
+  OUTROS
+}
+
+enum ResultadoExame {
+  NORMAL
+  ALTERADO
+  CRITICO
+  PENDENTE
+}
+
+enum ViaAplicacaoVacina {
+  INTRAMUSCULAR
+  SUBCUTANEA
+  ORAL
+  INTRADERMICA
+}
+
+enum TipoRelatorio {
+  PRODUCAO_INDIVIDUAL
+  ENCAMINHAMENTOS_POR_ESPECIALIDADE
+  FILA_REGULACAO
+  PENDENCIAS_RESOLVIDAS
+  TFD_CUSTOS
+  VACINACAO_UBS
+  BUSCA_ATIVA
+}
+
+enum FormatoRelatorio {
+  PDF
+  CSV
+  XLSX
+}
+
+enum StatusRelatorio {
+  DISPONIVEL
+  PROCESSANDO
+  FALHA
+}
+
+// ============================================================
+// UBS + Atendentes + Auth
+// ============================================================
+
+model Prefeitura {
+  id         String    @id @default(uuid())
+  nome       String
+  municipio  String
+  uf         String    @default("BA")
+  cnpj       String?   @unique
+  ativa      Boolean   @default(true)
+  deletadoEm DateTime?
+
+  ubs        Ubs[]
+  atendentes Atendente[]
+  relatorios Relatorio[] @relation("RelatorioPrefeitura")
+
+  // Face 4 (TFD)
+  veiculosTfd        VeiculoTFD[]            @relation("VeiculoPrefeitura")
+  motoristasTfd      MotoristaTFD[]          @relation("MotoristaPrefeitura")
+  solicitacoesTfd    SolicitacaoTFD[]        @relation("SolicTfdPrefeitura")
+  viagensFrota       ViagemFrota[]           @relation("ViagemFrotaPrefeitura")
+  abastecimentos     Abastecimento[]         @relation("AbastPrefeitura")
+  saldosVeiculos     SaldoVeiculo[]          @relation("SaldoVeicPrefeitura")
+  saldosAjudaCusto   SaldoAjudaCusto[]       @relation("SaldoAjudaPrefeitura")
+  aportesFrota       AporteSaldoFrota[]      @relation("AporteFrotaPrefeitura")
+  aportesAjudaCusto  AporteSaldoAjudaCusto[] @relation("AporteAjudaPrefeitura")
+  ajudasCusto        AjudaCusto[]            @relation("AjudaPrefeitura")
+  tfdAuditLogs       TfdAuditLog[]           @relation("TfdAuditPrefeitura")
+
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  @@map("prefeituras")
+}
+
+model Ubs {
+  id         String    @id @default(uuid())
+  nome       String
+  municipio  String
+  uf         String    @default("BA")
+  endereco   String?
+  cnes       String?   @unique
+  ativa      Boolean   @default(true)
+  deletadoEm DateTime?
+
+  prefeituraId String
+  prefeitura   Prefeitura @relation(fields: [prefeituraId], references: [id])
+
+  atendentes      Atendente[]
+  pacientes       Paciente[]
+  encaminhamentos Encaminhamento[]
+  relatorios      Relatorio[] @relation("RelatorioUbs")
+  solicitacoesTfd SolicitacaoTFD[] @relation("SolicTfdUbs")
+
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  @@index([prefeituraId])
+  @@map("ubs")
+}
+
+model Atendente {
+  id              String        @id @default(uuid())
+  matricula       String        @unique
+  nome            String
+  email           String        @unique
+  senhaHash       String
+  cpf             String        @unique
+  telefone        String?
+  dataNascimento  DateTime?
+  cargo           String        @default("ATENDENTE DE REGULAÇÃO")
+  funcao          String        @default("Operador do canal de ingestão de encaminhamentos")
+  role            RoleAtendente @default(ATENDENTE_UBS)
+  ativo           Boolean       @default(true)
+  bloqueadoAte    DateTime?
+  dataAdmissao    DateTime?
+
+  twoFAAtivo  Boolean @default(false)
+  metodoTwoFA String?
+
+  senhaAlteradaEm DateTime @default(now())
+  deletadoEm      DateTime?
+
+  // Escopo: DESENVOLVEDOR não tem nem ubsId nem prefeituraId.
+  //         ADMIN/REGULADOR_SMS têm prefeituraId (sem ubsId).
+  //         ATENDENTE_UBS/COORDENADOR_UBS têm ubsId (e herdam prefeituraId via UBS).
+  ubsId        String?
+  ubs          Ubs?        @relation(fields: [ubsId], references: [id])
+  prefeituraId String?
+  prefeitura   Prefeitura? @relation(fields: [prefeituraId], references: [id])
+
+  criadoPorId String?
+  criadoPor   Atendente?  @relation("CriadoPor", fields: [criadoPorId], references: [id])
+  criou       Atendente[] @relation("CriadoPor")
+
+  refreshTokens   RefreshToken[]
+  passwordResets  PasswordResetCode[]
+  tentativasLogin TentativaLogin[]
+  sessoes         Sessao[]
+  auditoria       AuditoriaLog[]
+  encaminhamentos Encaminhamento[]
+  relatorios      Relatorio[]
+  atividades      AtividadeAtendente[]
+
+  criadoEm    DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  @@map("atendentes")
+}
+
+model RefreshToken {
+  id          String   @id @default(uuid())
+  tokenHash   String   @unique
+  atendenteId String
+  atendente   Atendente @relation(fields: [atendenteId], references: [id], onDelete: Cascade)
+  expiraEm    DateTime
+  revogadoEm  DateTime?
+  sessaoId    String?  @unique
+  sessao      Sessao?  @relation(fields: [sessaoId], references: [id], onDelete: SetNull)
+  userAgent   String?
+  ip          String?
+
+  criadoEm DateTime @default(now())
+
+  @@map("refresh_tokens")
+}
+
+model Sessao {
+  id          String   @id @default(uuid())
+  atendenteId String
+  atendente   Atendente @relation(fields: [atendenteId], references: [id], onDelete: Cascade)
+  ip          String?
+  userAgent   String?
+  dispositivo String?
+  local       String?
+  ultimoUsoEm DateTime @default(now())
+  expiraEm    DateTime
+  revogadaEm  DateTime?
+  refreshToken RefreshToken?
+
+  criadaEm DateTime @default(now())
+
+  @@map("sessoes")
+}
+
+model PasswordResetCode {
+  id          String   @id @default(uuid())
+  atendenteId String
+  atendente   Atendente @relation(fields: [atendenteId], references: [id], onDelete: Cascade)
+  codigoHash  String
+  resetToken  String?  @unique
+  expiraEm    DateTime
+  consumidoEm DateTime?
+  tentativas  Int      @default(0)
+
+  criadoEm DateTime @default(now())
+
+  @@map("password_reset_codes")
+}
+
+model TentativaLogin {
+  id          String   @id @default(uuid())
+  login       String
+  ip          String?
+  userAgent   String?
+  sucesso     Boolean
+  atendenteId String?
+  atendente   Atendente? @relation(fields: [atendenteId], references: [id], onDelete: SetNull)
+
+  criadoEm DateTime @default(now())
+
+  @@index([login, criadoEm])
+  @@index([ip, criadoEm])
+  @@map("tentativas_login")
+}
+
+model AuditoriaLog {
+  id          String   @id @default(uuid())
+  acao        String
+  recurso     String
+  recursoId   String?
+  payload     Json?
+  atendenteId String?
+  atendente   Atendente? @relation(fields: [atendenteId], references: [id], onDelete: SetNull)
+  ip          String?
+  userAgent   String?
+
+  criadoEm DateTime @default(now())
+
+  @@index([recurso, recursoId])
+  @@index([atendenteId, criadoEm])
+  @@map("auditoria_logs")
+}
+
+model AtividadeAtendente {
+  id          String   @id @default(uuid())
+  atendenteId String
+  atendente   Atendente @relation(fields: [atendenteId], references: [id], onDelete: Cascade)
+  acao        String
+  alvo        String?
+  em          DateTime @default(now())
+
+  @@index([atendenteId, em])
+  @@map("atividades_atendente")
+}
+
+// ============================================================
+// PACIENTE (PEC)
+// ============================================================
+
+model Paciente {
+  id               String   @id @default(uuid())
+  nome             String
+  nomeSocial       String?
+  cpf              String   @unique
+  cartaoSus        String?  @unique  // pode ser null quando paciente não tem CSUS na hora do cadastro
+  dataNascimento   DateTime
+  sexo             Sexo
+  telefone         String?
+  telefoneSecundario String?
+  email            String?
+
+  nomeMae     String?
+  nomePai     String?
+  estadoCivil EstadoCivil @default(OUTRO)
+  escolaridade String?
+  profissao    String?
+  racaCor     RacaCor @default(NAO_INFORMADA)
+
+  endereco  String?
+  bairro    String?
+  municipio String?
+  uf        String?
+  cep       String?
+
+  grupoSanguineo GrupoSanguineo @default(NAO_INFORMADO)
+  historicoFamiliar String[]    @default([])
+
+  agenteComunitario String?
+  microarea         String?
+  equipeSaudeFamilia String?
+
+  ubsId String
+  ubs   Ubs    @relation(fields: [ubsId], references: [id])
+
+  alergias          Alergia[]
+  condicoesCronicas CondicaoCronica[]
+  medicamentosEmUso MedicamentoEmUso[]
+  atendimentos      Atendimento[]
+  viagensTFD        ViagemTFD[]
+  exames            ExameRealizado[]
+  vacinacoes        VacinaAplicada[]
+  medicosAtendentes MedicoAtendente[]
+  encaminhamentos   Encaminhamento[]
+
+  // Face 4 (TFD)
+  solicitacoesTfd        SolicitacaoTFD[]
+  viagemPassageiroLista  ViagemPassageiro[] @relation("PacienteViagemPassageiro")
+  ajudasCusto            AjudaCusto[]       @relation("PacienteAjudaCusto")
+
+  cadastradoEm DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+  deletadoEm   DateTime?
+
+  @@index([ubsId])
+  @@index([nome])
+  @@map("pacientes")
+}
+
+model Alergia {
+  id         String   @id @default(uuid())
+  pacienteId String
+  paciente   Paciente @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  substancia String
+  tipo       TipoAlergia
+  gravidade  GravidadeAlergia
+  observacao String?
+
+  @@map("alergias")
+}
+
+model CondicaoCronica {
+  id         String   @id @default(uuid())
+  pacienteId String
+  paciente   Paciente @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  cid10      String
+  descricao  String
+  desde      DateTime
+  ativo      Boolean  @default(true)
+  observacao String?
+
+  @@map("condicoes_cronicas")
+}
+
+model MedicamentoEmUso {
+  id          String   @id @default(uuid())
+  pacienteId  String
+  paciente    Paciente @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  nome        String
+  dosagem     String
+  frequencia  String
+  desde       DateTime
+  prescritor  String
+  ativo       Boolean  @default(true)
+
+  @@map("medicamentos_em_uso")
+}
+
+model Atendimento {
+  id                   String          @id @default(uuid())
+  pacienteId           String
+  paciente             Paciente        @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  data                 DateTime
+  tipo                 TipoAtendimento
+  profissional         String
+  registroProfissional String
+  especialidade        String
+  unidade              String
+  queixaPrincipal      String
+  diagnostico          String
+  cid10                String
+  conduta              String
+  prescricaoResumo     String?
+
+  @@index([pacienteId, data])
+  @@map("atendimentos")
+}
+
+model ViagemTFD {
+  id                String          @id @default(uuid())
+  protocolo         String          @unique
+  pacienteId        String
+  paciente          Paciente        @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  dataIda           DateTime
+  dataVolta         DateTime
+  destino           String
+  unidadeDestino    String
+  motivo            String
+  especialidade     String
+  acompanhante      Boolean         @default(false)
+  transporte        TransporteTFD
+  status            StatusViagemTFD @default(AGENDADA)
+  custoEstimadoBRL  Float           @default(0)
+
+  criadaEm   DateTime @default(now())
+  atualizadaEm DateTime @updatedAt
+
+  @@index([pacienteId])
+  @@map("viagens_tfd")
+}
+
+model ExameRealizado {
+  id                String         @id @default(uuid())
+  pacienteId        String
+  paciente          Paciente       @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  data              DateTime
+  tipo              String
+  categoria         CategoriaExame
+  solicitante       String
+  unidadeExecutora  String
+  resultado         ResultadoExame
+  observacao        String?
+
+  @@index([pacienteId, data])
+  @@map("exames_realizados")
+}
+
+model VacinaAplicada {
+  id         String              @id @default(uuid())
+  pacienteId String
+  paciente   Paciente            @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  data       DateTime
+  vacina     String
+  dose       String
+  lote       String
+  aplicador  String
+  unidade    String
+  via        ViaAplicacaoVacina
+
+  @@index([pacienteId, data])
+  @@map("vacinas_aplicadas")
+}
+
+model MedicoAtendente {
+  id              String   @id @default(uuid())
+  pacienteId      String
+  paciente        Paciente @relation(fields: [pacienteId], references: [id], onDelete: Cascade)
+  nome            String
+  registro        String
+  especialidade   String
+  unidade         String
+  ultimaConsulta  DateTime
+  totalConsultas  Int      @default(1)
+
+  @@map("medicos_atendentes")
+}
+
+// ============================================================
+// ENCAMINHAMENTOS
+// ============================================================
+
+model Encaminhamento {
+  id        String               @id @default(uuid())
+  protocolo String               @unique
+  status    StatusEncaminhamento @default(AGUARDANDO_REGULACAO)
+
+  // Paciente (snapshot + FK quando reconhecido)
+  pacienteId String?
+  paciente   Paciente? @relation(fields: [pacienteId], references: [id])
+  pacienteNome         String
+  pacienteCpf          String
+  pacienteCartaoSus    String
+  pacienteDataNascimento DateTime
+  pacienteSexo         Sexo
+  pacienteTelefone     String
+  pacienteEndereco     String
+
+  // Solicitação médica
+  medicoSolicitante       String
+  crm                     String
+  especialidadeSolicitada String
+  cid10                   String
+  cidDescricao            String
+  justificativaClinica    String
+  prioridade              PrioridadeClinica
+  dataSolicitacao         DateTime
+
+  observacoesRegulacao String?
+  agendamentoPrevisto  DateTime?
+
+  // Resposta SUS Federal (enrichment pós-aprovação)
+  respostaSusAnexoId           String?
+  respostaSusObservacao        String?
+  respostaSusRegistradoEm      DateTime?
+  respostaSusRegistradoPorId   String?
+  respostaSusRegistradoPorNome String?
+  respostaSusRegistradoPorMat  String?
+
+  unidadeOrigem        String
+  atendenteResponsavel String
+
+  ubsId         String
+  ubs           Ubs       @relation(fields: [ubsId], references: [id])
+  atendenteId   String
+  atendente     Atendente @relation(fields: [atendenteId], references: [id])
+
+  anexos   AnexoDocumento[]
+  timeline EventoTimeline[]
+
+  criadoEm    DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+  deletadoEm  DateTime?
+
+  @@index([ubsId, status, criadoEm])
+  @@index([pacienteId])
+  @@index([atendenteId])
+  @@map("encaminhamentos")
+}
+
+enum StatusScanAnexo {
+  PENDENTE
+  LIMPO
+  INFECTADO
+  FALHOU
+}
+
+model AnexoDocumento {
+  id               String    @id @default(uuid())
+  encaminhamentoId String
+  encaminhamento   Encaminhamento @relation(fields: [encaminhamentoId], references: [id], onDelete: Cascade)
+  nome             String
+  tipo             TipoAnexo
+  tamanhoKb        Int
+  mimeType         String
+  caminho          String
+  sha256           String?
+  scanStatus       StatusScanAnexo @default(PENDENTE)
+  scanEm           DateTime?
+  uploadEm         DateTime  @default(now())
+
+  @@index([encaminhamentoId])
+  @@index([scanStatus])
+  @@map("anexos_documentos")
+}
+
+model EventoTimeline {
+  id               String             @id @default(uuid())
+  encaminhamentoId String
+  encaminhamento   Encaminhamento     @relation(fields: [encaminhamentoId], references: [id], onDelete: Cascade)
+  tipo             TipoEventoTimeline
+  titulo           String
+  descricao        String
+  autor            String
+  autorPapel       String
+  em               DateTime           @default(now())
+
+  @@index([encaminhamentoId, em])
+  @@map("eventos_timeline")
+}
+
+// ============================================================
+// RELATÓRIOS
+// ============================================================
+
+enum AcaoAuditRelatorio {
+  CRIADO
+  DOWNLOAD
+  FALHA
+  EXPIRADO
+  EXCLUIDO
+}
+
+/**
+ * Job de relatório (LGPD-first).
+ * Spec completa: backend/docs/RELATORIOS.md
+ */
+model Relatorio {
+  id             String           @id @default(uuid())
+  tipo           TipoRelatorio
+  titulo         String           // "Fila de Regulação · Abr/2026" — backend monta
+  periodoIni     DateTime
+  periodoFim     DateTime
+  formato        FormatoRelatorio
+  status         StatusRelatorio  @default(PROCESSANDO)
+  filtros        Json             @default("{}")
+  erroTraceId    String?
+
+  // Autoria & escopo RBAC
+  atendenteId    String
+  atendente      Atendente   @relation(fields: [atendenteId], references: [id], onDelete: Cascade)
+  prefeituraId   String
+  prefeituraRel  Prefeitura  @relation("RelatorioPrefeitura", fields: [prefeituraId], references: [id])
+  ubsId          String?
+  ubsRel         Ubs?        @relation("RelatorioUbs", fields: [ubsId], references: [id])
+
+  // Storage
+  storageKey     String?    // S3 key ou caminho relativo
+  contentType    String?
+  tamanhoBytes   BigInt?
+  tamanhoKb      Int        @default(0) // derivado de tamanhoBytes/1024 (compat com frontend)
+  hashSha256     String?    // não-repúdio
+
+  // Ciclo de vida
+  geradoEm       DateTime   @default(now()) // criadoEm do job
+  finalizadoEm   DateTime?                  // quando worker terminou
+  expiraEm       DateTime                   // now() + 7 dias (TTL LGPD)
+  downloads      Int        @default(0)
+  ultimoDownload DateTime?
+
+  auditoria      RelatorioAudit[]
+
+  @@index([atendenteId, geradoEm(sort: Desc)])
+  @@index([prefeituraId, geradoEm(sort: Desc)])
+  @@index([status, geradoEm])
+  @@index([expiraEm])
+  @@map("relatorio_job")
+}
+
+/**
+ * Auditoria imutável de relatórios (append-only). Retenção mínima 5 anos
+ * por exigência da LGPD art. 37 + boa prática setor público.
+ */
+model RelatorioAudit {
+  id           BigInt   @id @default(autoincrement())
+  relatorioId  String
+  relatorio    Relatorio @relation(fields: [relatorioId], references: [id])
+  atendenteId  String
+  acao         AcaoAuditRelatorio
+  ip           String?
+  userAgent    String?
+  detalhes     Json?     // snapshot dos filtros no CRIADO, motivo no FALHA, etc.
+  em           DateTime  @default(now())
+
+  @@index([relatorioId, em(sort: Desc)])
+  @@index([atendenteId, em(sort: Desc)])
+  @@map("relatorio_audit")
+}
+
+// ============================================================
+// Contadores sequenciais (para protocolos UBS-AAAA-NNNNNN etc.)
+// ============================================================
+
+model SequencialProtocolo {
+  chave String @id
+  valor Int    @default(0)
+
+  @@map("sequenciais_protocolo")
+}
+
+// ============================================================
+// APP DO PACIENTE (Face 3)
+// ============================================================
+
+/**
+ * Conta de acesso do paciente no app.
+ * A chave é o CPF (normalizado sem pontuação).
+ * O paciente pode ter múltiplos encaminhamentos (em múltiplas UBSs/prefeituras).
+ */
+model PacienteConta {
+  id         String @id @default(uuid())
+  cpf        String @unique // "12345678900" (dígitos)
+  cpfFormatado String // "123.456.789-00"
+  nome       String
+  email      String?
+  telefone   String?
+  senhaHash  String
+  ativo      Boolean @default(true)
+  // true quando a senha ainda é o CPF (padrão de primeira criação).
+  // O app do paciente DEVE forçar troca de senha antes de prosseguir.
+  senhaProvisoria Boolean @default(false)
+
+  sessoesPaciente       SessaoPaciente[]
+  notificacoes          NotificacaoPaciente[]
+
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  @@map("pacientes_contas")
+}
+
+model SessaoPaciente {
+  id          String @id @default(uuid())
+  contaId     String
+  conta       PacienteConta @relation(fields: [contaId], references: [id], onDelete: Cascade)
+  tokenHash   String @unique
+  ip          String?
+  userAgent   String?
+  expiraEm    DateTime
+  revogadaEm  DateTime?
+  criadaEm    DateTime @default(now())
+
+  @@index([contaId])
+  @@map("sessoes_paciente")
+}
+
+model NotificacaoPaciente {
+  id                String                  @id @default(uuid())
+  contaId           String
+  conta             PacienteConta           @relation(fields: [contaId], references: [id], onDelete: Cascade)
+  pacienteCpf       String // fallback de match por CPF (caso conta seja criada após o encaminhamento)
+  encaminhamentoId  String?
+  tipo              TipoNotificacaoPaciente
+  titulo            String
+  corpo             String
+  payload           Json? // dados estruturados (protocolo, anexoId, agendamento, etc.)
+  lidaEm            DateTime?
+  criadaEm          DateTime                @default(now())
+
+  @@index([contaId, criadaEm])
+  @@index([pacienteCpf, criadaEm])
+  @@index([encaminhamentoId])
+  @@map("notificacoes_paciente")
+}
+
+// ============================================================
+// Outbox Events (event-driven · at-least-once delivery)
+// ============================================================
+
+model OutboxEvent {
+  id            String   @id @default(uuid())
+  eventType     String
+  aggregateType String
+  aggregateId   String
+  payload       Json
+  criadoEm      DateTime @default(now())
+  publicadoEm   DateTime?
+  tentativas    Int      @default(0)
+  ultimoErro    String?
+
+  @@index([publicadoEm, criadoEm])
+  @@index([aggregateType, aggregateId])
+  @@map("outbox_events")
+}
+
+// ============================================================
+// AUDITORIA DE PRONTUÁRIO (Res. CFM 1.821/2007 · retenção 20 anos)
+// ============================================================
+
+enum AcaoProntuario {
+  ADD_ALERGIA
+  REMOVE_ALERGIA
+  ADD_CONDICAO_CRONICA
+  UPDATE_CONDICAO_CRONICA
+  REMOVE_CONDICAO_CRONICA
+  ADD_MEDICAMENTO
+  UPDATE_MEDICAMENTO
+  REMOVE_MEDICAMENTO
+  SET_HISTORICO_FAMILIAR
+  ADD_ATENDIMENTO
+  REMOVE_ATENDIMENTO
+  ADD_EXAME
+  REMOVE_EXAME
+  ADD_VACINA
+  REMOVE_VACINA
+  ADD_VIAGEM_TFD
+  UPDATE_VIAGEM_TFD
+  REMOVE_VIAGEM_TFD
+}
+
+/**
+ * Registro imutável de toda operação sobre o prontuário.
+ *
+ * Append-only: nunca deletar. Retenção mínima 20 anos (Res. CFM 1.821/2007 art. 8º).
+ * Nunca expor PII do paciente aqui — só IDs e metadados; a PII vai em `dados` (JSON)
+ * já em formato mascarado quando aplicável.
+ */
+model PacienteProntuarioAudit {
+  id          String          @id @default(uuid())
+  pacienteId  String
+  autorId     String          // atendenteId
+  autorNome   String          // snapshot (usado em relatório mesmo se atendente for deletado)
+  autorPapel  String          // "ATENDENTE_UBS · UBS Central"
+  acao        AcaoProntuario
+  recursoId   String?         // id do sub-documento afetado (alergiaId, atendimentoId, etc.)
+  dados       Json            // snapshot do payload (útil pra auditor reconstruir operação)
+  ip          String?
+  userAgent   String?
+  em          DateTime        @default(now())
+
+  @@index([pacienteId, em])
+  @@index([autorId, em])
+  @@index([acao, em])
+  @@map("paciente_prontuario_audit")
+}
+
+// ============================================================
+// FACE 4 · TFD (Tratamento Fora do Domicílio)
+// Spec completa: backend/docs/TFD_API.md
+// ============================================================
+
+enum TipoVeiculoTFD {
+  VAN
+  ONIBUS
+  CARRO
+  AMBULANCIA
+}
+
+enum StatusVeiculoTFD {
+  ATIVO
+  EM_MANUTENCAO
+  INATIVO
+}
+
+enum CombustivelVeiculo {
+  DIESEL
+  GASOLINA
+  ETANOL
+  FLEX
+  GNV
+  ELETRICO
+}
+
+enum CategoriaCNH {
+  B
+  C
+  D
+  E
+}
+
+enum StatusMotoristaTFD {
+  ATIVO
+  AFASTADO
+  INATIVO
+}
+
+enum StatusSolicitacaoTFD {
+  PENDENTE
+  APROVADA
+  ALOCADA
+  REALIZADA
+  NEGADA
+  CANCELADA
+}
+
+enum PrioridadeSolicTFD {
+  ELETIVA
+  PRIORITARIA
+  URGENTE
+}
+
+enum TipoAnexoSolicTFD {
+  COMPROVANTE_ENCAMINHAMENTO
+  EXAME
+  LAUDO
+  OUTRO
+}
+
+enum StatusViagemFrota {
+  AGENDADA
+  EM_ANDAMENTO
+  CONCLUIDA
+  CANCELADA
+}
+enum PresencaPassageiro {
+  AGUARDANDO
+  CONFIRMADO
+  EMBARCADO
+  AUSENTE
+  DESISTIU
+}
+enum StatusAbastecimento {
+  SOLICITADO
+  LIBERADO
+  REALIZADO
+  NEGADO
+}
+enum StatusAjudaCusto {
+  PENDENTE
+  AUTORIZADA
+  PAGA
+  NEGADA
+  CANCELADA
+}
+enum MetodoPagamentoAjuda {
+  PIX
+  TRANSFERENCIA
+  DINHEIRO_RH
+}
+
+/**
+ * Operações auditáveis na Face 4. Todo registro vai pra `tfd_audit_log` com
+ * hash encadeado (SHA-256) — vide TFD_API.md §6.
+ */
+enum AcaoAuditoriaTFD {
+  // Frota
+  VEICULO_CRIADO
+  VEICULO_ATUALIZADO
+  VEICULO_MANUTENCAO
+  VEICULO_REATIVADO
+  VEICULO_DELETADO
+  // Motoristas
+  MOTORISTA_CRIADO
+  MOTORISTA_ATUALIZADO
+  MOTORISTA_AFASTADO
+  MOTORISTA_REATIVADO
+  MOTORISTA_DELETADO
+  // Solicitações
+  SOLICITACAO_CRIADA
+  SOLICITACAO_APROVADA
+  SOLICITACAO_NEGADA
+  SOLICITACAO_ANEXO_ENVIADO
+  // Viagens
+  VIAGEM_CRIADA
+  VIAGEM_ATUALIZADA
+  VIAGEM_INICIADA
+  VIAGEM_CONCLUIDA
+  VIAGEM_CANCELADA
+  PASSAGEIRO_ALOCADO
+  PASSAGEIRO_REMOVIDO
+  PRESENCA_MARCADA
+  // Abastecimento
+  ABASTECIMENTO_SOLICITADO
+  ABASTECIMENTO_LIBERADO
+  ABASTECIMENTO_NEGADO
+  ABASTECIMENTO_REALIZADO
+  // Saldo
+  SALDO_AJUSTADO
+  SALDO_APORTADO
+  SALDO_AJUDA_AJUSTADO
+  SALDO_AJUDA_APORTADO
+  // Ajuda de custo
+  AJUDA_CUSTO_CRIADA
+  AJUDA_CUSTO_AUTORIZADA
+  AJUDA_CUSTO_PAGA
+  AJUDA_CUSTO_NEGADA
+}
+
+/**
+ * Origem orçamentária de um aporte de saldo (frota ou ajuda de custo).
+ * EMPENHO/PORTARIA exigem `numeroDocumento`; OUTRO exige `descricaoFonte`.
+ */
+enum FonteRecursoTFD {
+  EMPENHO
+  PORTARIA
+  REPASSE_FEDERAL
+  REPASSE_ESTADUAL
+  REMANEJAMENTO
+  OUTRO
+}
+
+// ----- Frota -----
+model VeiculoTFD {
+  id                  String  @id @default(uuid())
+  prefeituraId        String
+  prefeitura          Prefeitura @relation("VeiculoPrefeitura", fields: [prefeituraId], references: [id])
+  placa               String
+  modelo              String
+  tipo                TipoVeiculoTFD
+  capacidade          Int
+  ano                 Int
+  combustivel         CombustivelVeiculo
+  consumoMedioKml     Decimal  @db.Decimal(5, 2)
+  hodometroAtualKm    BigInt   @default(0)
+  proximaRevisaoKm    BigInt?
+  proximaRevisaoEm    DateTime?
+  status              StatusVeiculoTFD @default(ATIVO)
+
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+  deletadoEm   DateTime?
+  criadoPorId  String
+
+  abastecimentos Abastecimento[]
+  viagens        ViagemFrota[]
+  saldos         SaldoVeiculo[]
+
+  @@index([prefeituraId, status, deletadoEm])
+  @@index([placa])
+  @@map("tfd_veiculos")
+}
+
+model MotoristaTFD {
+  id              String  @id @default(uuid())
+  prefeituraId    String
+  prefeitura      Prefeitura @relation("MotoristaPrefeitura", fields: [prefeituraId], references: [id])
+  nome            String
+  cpf             String   // só dígitos
+  cnh             String
+  categoriaCnh    CategoriaCNH
+  validadeCnh     DateTime
+  telefone        String
+  status          StatusMotoristaTFD @default(ATIVO)
+  totalViagens    Int     @default(0)
+  totalKmRodados  BigInt  @default(0)
+
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+  deletadoEm   DateTime?
+  criadoPorId  String
+
+  viagens         ViagemFrota[]
+  abastecimentos  Abastecimento[]
+
+  @@index([prefeituraId, status, deletadoEm])
+  @@index([cpf])
+  @@map("tfd_motoristas")
+}
+
+// ----- Solicitações -----
+model SolicitacaoTFD {
+  id                       String   @id @default(uuid())
+  protocolo                String   @unique // TFD-AAAA-NNNNNN
+  prefeituraId             String
+  prefeitura               Prefeitura @relation("SolicTfdPrefeitura", fields: [prefeituraId], references: [id])
+  pacienteId               String
+  paciente                 Paciente   @relation(fields: [pacienteId], references: [id])
+  ubsId                    String?
+  ubs                      Ubs?       @relation("SolicTfdUbs", fields: [ubsId], references: [id])
+  encaminhamentoOrigemId   String?
+  destino                  String
+  unidadeDestino           String?
+  especialidade            String
+  motivo                   String
+  dataDesejada             DateTime
+  acompanhanteNecessario   Boolean  @default(false)
+  acompanhante             Json?    // DadosAcompanhante (Face 4 v0.10)
+  prioridade               PrioridadeSolicTFD
+  status                   StatusSolicitacaoTFD @default(PENDENTE)
+  observacoes              String?
+  motivoNegacao            String?
+
+  viagemId                 String?
+  viagem                   ViagemFrota? @relation(fields: [viagemId], references: [id])
+
+  criadaEm      DateTime @default(now())
+  criadaPorId   String?
+  criadaPorNome String?
+  decididaEm    DateTime?
+  decididaPorId String?
+  deletadaEm    DateTime?
+
+  anexos      AnexoSolicitacaoTFD[]
+  passageiros ViagemPassageiro[]
+
+  @@index([prefeituraId, status, criadaEm])
+  @@index([pacienteId])
+  @@map("tfd_solicitacoes")
+}
+
+model AnexoSolicitacaoTFD {
+  id            String   @id @default(uuid())
+  solicitacaoId String
+  solicitacao   SolicitacaoTFD @relation(fields: [solicitacaoId], references: [id], onDelete: Cascade)
+  nome          String
+  tipo          TipoAnexoSolicTFD
+  tamanhoKb     Int
+  storageKey    String
+  scanStatus    StatusScanAnexo @default(PENDENTE)
+  scanEm        DateTime?
+  uploadEm      DateTime @default(now())
+  uploadPorId   String
+
+  @@index([solicitacaoId])
+  @@map("tfd_solicitacao_anexos")
+}
+
+// ----- Viagens -----
+model ViagemFrota {
+  id                    String   @id @default(uuid())
+  prefeituraId          String
+  prefeitura            Prefeitura @relation("ViagemFrotaPrefeitura", fields: [prefeituraId], references: [id])
+  data                  DateTime  // date only (YYYY-MM-DD UTC)
+  horaSaida             String    // HH:mm
+  horaPrevistaRetorno   String?
+  veiculoId             String
+  veiculo               VeiculoTFD @relation(fields: [veiculoId], references: [id])
+  motoristaId           String
+  motorista             MotoristaTFD @relation(fields: [motoristaId], references: [id])
+  destino               String
+  unidadeDestino        String?
+  rotaResumo            String?
+  kmEstimados           Int?
+  kmInicialHodometro    BigInt?
+  kmFinalHodometro      BigInt?
+  vagasTotais           Int
+  observacoes           String?
+  status                StatusViagemFrota @default(AGENDADA)
+
+  criadaEm        DateTime @default(now())
+  criadaPorId     String
+  iniciadaEm      DateTime?
+  concluidaEm     DateTime?
+  motivoCancelamento String?
+
+  passageiros     ViagemPassageiro[]
+  abastecimentos  Abastecimento[]
+  ajudasCusto     AjudaCusto[]
+  solicitacoes    SolicitacaoTFD[]
+
+  @@index([prefeituraId, status, data])
+  @@index([veiculoId, data])
+  @@index([motoristaId, data])
+  @@map("tfd_viagens")
+}
+
+model ViagemPassageiro {
+  id              String  @id @default(uuid())
+  viagemId        String
+  viagem          ViagemFrota @relation(fields: [viagemId], references: [id], onDelete: Cascade)
+  solicitacaoId   String
+  solicitacao     SolicitacaoTFD @relation(fields: [solicitacaoId], references: [id])
+  pacienteId      String
+  paciente        Paciente @relation("PacienteViagemPassageiro", fields: [pacienteId], references: [id])
+  /// Assento escolhido (BlaBlaCar style). Opcional — se null, é alocação livre.
+  /// Quando preenchido, exclusivo dentro da viagem.
+  numeroAssento   Int?
+  acompanhante    Boolean @default(false)
+  presenca        PresencaPassageiro @default(AGUARDANDO)
+  observacao      String?
+  marcadoEm       DateTime?
+  marcadoPorId    String?
+
+  @@unique([viagemId, solicitacaoId])
+  @@unique([viagemId, numeroAssento])
+  @@index([viagemId])
+  @@map("tfd_viagem_passageiros")
+}
+
+// ----- Abastecimento -----
+model Abastecimento {
+  id              String  @id @default(uuid())
+  protocolo       String  @unique  // ABT-AAAA-NNNNNN
+  prefeituraId    String
+  prefeitura      Prefeitura @relation("AbastPrefeitura", fields: [prefeituraId], references: [id])
+  veiculoId       String
+  veiculo         VeiculoTFD @relation(fields: [veiculoId], references: [id])
+  motoristaId    String?
+  motorista      MotoristaTFD? @relation(fields: [motoristaId], references: [id])
+  viagemId       String?
+  viagem         ViagemFrota? @relation(fields: [viagemId], references: [id])
+  posto          String
+  litros         Decimal  @db.Decimal(8, 2) @default(0)
+  combustivel    CombustivelVeiculo
+  valorPorLitro  Decimal  @db.Decimal(8, 3) @default(0)
+  valorEstimado  Decimal  @db.Decimal(12, 2) @default(0)
+  valorTotal     Decimal  @db.Decimal(12, 2) @default(0)
+  hodometroKm    BigInt   @default(0)
+  kmDesdeUltimo  Int?
+  consumoCalcKml Decimal? @db.Decimal(5, 2)
+  status         StatusAbastecimento @default(SOLICITADO)
+  comprovanteKey String?
+  motivoNegacao  String?
+
+  solicitadoEm   DateTime @default(now())
+  solicitadoPorId String
+  liberadoEm     DateTime?
+  liberadoPorId  String?
+  realizadoEm    DateTime?
+  realizadoPorId String?
+
+  @@index([prefeituraId, status, solicitadoEm])
+  @@index([veiculoId, solicitadoEm])
+  @@map("tfd_abastecimentos")
+}
+
+// ----- Saldo -----
+model SaldoVeiculo {
+  veiculoId         String
+  veiculo           VeiculoTFD @relation(fields: [veiculoId], references: [id])
+  prefeituraId      String
+  prefeitura        Prefeitura @relation("SaldoVeicPrefeitura", fields: [prefeituraId], references: [id])
+  mes               String    // YYYY-MM
+  saldoMensal       Decimal   @db.Decimal(14, 2)
+  saldoConsumido    Decimal   @db.Decimal(14, 2) @default(0)
+  saldoReservado    Decimal   @db.Decimal(14, 2) @default(0)
+
+  atualizadoEm DateTime @updatedAt
+
+  @@id([veiculoId, mes])
+  @@index([prefeituraId, mes])
+  @@map("tfd_saldo_veiculo")
+}
+
+model SaldoAjuste {
+  id             String  @id @default(uuid())
+  veiculoId      String
+  prefeituraId   String
+  mes            String
+  saldoAnterior  Decimal @db.Decimal(14, 2)
+  saldoNovo      Decimal @db.Decimal(14, 2)
+  justificativa  String
+  ajustadoPorId  String
+  ajustadoEm     DateTime @default(now())
+
+  @@index([veiculoId, mes])
+  @@map("tfd_saldo_ajustes")
+}
+
+/**
+ * Aporte de saldo de combustível por veículo. SOMA `valorBRL` em SaldoVeiculo.
+ * `rateioGeral=true` cria N registros (um por veículo ATIVO) no mesmo grupo.
+ */
+model AporteSaldoFrota {
+  id              String  @id @default(uuid())
+  prefeituraId    String
+  prefeitura      Prefeitura @relation("AporteFrotaPrefeitura", fields: [prefeituraId], references: [id])
+  veiculoId       String?
+  rateioGeral     Boolean @default(false)
+  /// Identifica os N registros gerados num único `aportar` com rateio.
+  grupoRateioId   String?
+  mes             String   // YYYY-MM
+  valorBRL        Decimal  @db.Decimal(14, 2)
+  fonte           FonteRecursoTFD
+  numeroDocumento String?
+  descricaoFonte  String?
+  justificativa   String
+  operadorId      String
+  criadoEm        DateTime @default(now())
+
+  @@index([prefeituraId, mes, criadoEm])
+  @@index([veiculoId, mes])
+  @@index([grupoRateioId])
+  @@map("tfd_saldo_frota_aportes")
+}
+
+/**
+ * Saldo orçamentário mensal de Ajuda de Custo (único por prefeitura × mês).
+ * Tetos por categoria — 0 = sem teto.
+ */
+model SaldoAjudaCusto {
+  prefeituraId      String
+  prefeitura        Prefeitura @relation("SaldoAjudaPrefeitura", fields: [prefeituraId], references: [id])
+  mes               String     // YYYY-MM
+  saldoMensal       Decimal    @db.Decimal(14, 2) @default(0)
+  saldoConsumido    Decimal    @db.Decimal(14, 2) @default(0)
+  saldoReservado    Decimal    @db.Decimal(14, 2) @default(0)
+  tetoAlimentacao   Decimal    @db.Decimal(12, 2) @default(0)
+  tetoHospedagem    Decimal    @db.Decimal(12, 2) @default(0)
+  tetoDeslocamento  Decimal    @db.Decimal(12, 2) @default(0)
+
+  atualizadoEm DateTime @updatedAt
+
+  @@id([prefeituraId, mes])
+  @@map("tfd_saldo_ajuda_custo")
+}
+
+/**
+ * Aporte de saldo de ajuda de custo (SOMA em SaldoAjudaCusto).
+ */
+model AporteSaldoAjudaCusto {
+  id              String  @id @default(uuid())
+  prefeituraId    String
+  prefeitura      Prefeitura @relation("AporteAjudaPrefeitura", fields: [prefeituraId], references: [id])
+  mes             String
+  valorBRL        Decimal  @db.Decimal(14, 2)
+  fonte           FonteRecursoTFD
+  numeroDocumento String?
+  descricaoFonte  String?
+  justificativa   String
+  operadorId      String
+  criadoEm        DateTime @default(now())
+
+  @@index([prefeituraId, mes, criadoEm])
+  @@map("tfd_saldo_ajuda_aportes")
+}
+
+/**
+ * Ajustes manuais ao saldo de ajuda de custo (sobrescreve mensal/tetos).
+ */
+model SaldoAjudaCustoAjuste {
+  id                       String  @id @default(uuid())
+  prefeituraId             String
+  mes                      String
+  saldoAnterior            Decimal @db.Decimal(14, 2)
+  saldoNovo                Decimal @db.Decimal(14, 2)
+  tetoAlimentacaoAnterior  Decimal @db.Decimal(12, 2)
+  tetoAlimentacaoNovo      Decimal @db.Decimal(12, 2)
+  tetoHospedagemAnterior   Decimal @db.Decimal(12, 2)
+  tetoHospedagemNovo       Decimal @db.Decimal(12, 2)
+  tetoDeslocamentoAnterior Decimal @db.Decimal(12, 2)
+  tetoDeslocamentoNovo     Decimal @db.Decimal(12, 2)
+  justificativa            String
+  ajustadoPorId            String
+  ajustadoEm               DateTime @default(now())
+
+  @@index([prefeituraId, mes])
+  @@map("tfd_saldo_ajuda_ajustes")
+}
+
+/**
+ * Idempotência: caching das respostas de mutações com `X-Idempotency-Key`.
+ * TTL = 24h (limpeza por job ou por ON DELETE com timestamp). A chave é
+ * SHA-256 de (operadorId + key + method + path) — evita colisões entre rotas.
+ */
+model TfdIdempotencyKey {
+  hash         String   @id          // sha256(operadorId|key|method|path)
+  operadorId   String
+  method       String
+  path         String
+  statusCode   Int
+  responseJson Json
+  criadoEm     DateTime @default(now())
+  expiraEm     DateTime
+
+  @@index([operadorId, criadoEm])
+  @@index([expiraEm])
+  @@map("tfd_idempotency_keys")
+}
+
+// ----- Ajuda de Custo -----
+model AjudaCusto {
+  id                          String   @id @default(uuid())
+  protocolo                   String   @unique  // AJC-AAAA-NNNNNN
+  prefeituraId                String
+  prefeitura                  Prefeitura @relation("AjudaPrefeitura", fields: [prefeituraId], references: [id])
+  viagemId                    String
+  viagem                      ViagemFrota @relation(fields: [viagemId], references: [id])
+  pacienteId                  String
+  paciente                    Paciente @relation("PacienteAjudaCusto", fields: [pacienteId], references: [id])
+  itens                       Json    // [{ categoria, descricao, valorBRL }]
+  valorTotal                  Decimal @db.Decimal(12, 2)
+  status                      StatusAjudaCusto @default(PENDENTE)
+  metodoPagamento             MetodoPagamentoAjuda?
+  comprovantePagamentoKey     String?
+  motivoNegacao               String?
+
+  criadaEm       DateTime @default(now())
+  criadaPorId    String
+  autorizadaEm   DateTime?
+  autorizadaPorId String?
+  pagaEm         DateTime?
+  pagaPorId      String?
+
+  @@unique([viagemId, pacienteId])
+  @@index([prefeituraId, status, criadaEm])
+  @@map("tfd_ajudas_custo")
+}
+
+// ----- Auditoria TJ (cadeia hash imutável) -----
+model TfdAuditLog {
+  id                String  @id @default(uuid())
+  prefeituraId      String
+  prefeitura        Prefeitura @relation("TfdAuditPrefeitura", fields: [prefeituraId], references: [id])
+  acao              AcaoAuditoriaTFD
+  recursoTipo       String
+  recursoId         String
+  recursoProtocolo  String?
+  operadorId        String
+  operadorNome      String
+  operadorMatricula String
+  operadorRole      String
+  ip                String
+  userAgent         String
+  antes             Json?
+  depois            Json?
+  hashAnterior      String   // SHA-256 (64 hex chars)
+  hash              String   // SHA-256(this | hashAnterior)
+  em                DateTime @default(now())
+
+  @@index([prefeituraId, em(sort: Desc)])
+  @@index([recursoTipo, recursoId, em(sort: Desc)])
+  @@index([acao, em])
+  @@map("tfd_audit_log")
+}
